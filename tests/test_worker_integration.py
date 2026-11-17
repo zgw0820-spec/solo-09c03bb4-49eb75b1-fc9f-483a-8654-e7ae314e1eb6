@@ -165,6 +165,24 @@ def dataset(records: int = 40, seed: int = 21):
     return {"features": features, "labels": labels, "epochs": 3}
 
 
+def holdout_dataset():
+    """Training data plus independent, both-class held-out records."""
+    rng = np.random.default_rng(77)
+    holdout_features = rng.normal(size=(6, 4)).tolist()
+    holdout_labels = [1 if row[0] + row[1] > 0 else 0 for row in holdout_features]
+    assert 0 < sum(holdout_labels) < len(holdout_labels)
+    body = dataset(records=40, seed=22)
+    body.update(
+        {
+            "holdout_features": holdout_features,
+            "holdout_labels": holdout_labels,
+            "min_recall": 0.5,
+            "max_false_positive_rate": 0.5,
+        }
+    )
+    return body
+
+
 @pytest.fixture(scope="module")
 def uninterrupted(tmp_path_factory):
     """Reference run with no interruption at all."""
@@ -220,6 +238,66 @@ def test_crash_and_takeover_matches_uninterrupted(tmp_path, uninterrupted):
         starts = [e for e in events if e["event"] == "training_started"]
         assert [e["detail"]["worker_id"] for e in starts] == ["worker-a", "worker-b"]
         assert starts[1]["detail"]["resumed_from_step"] == at_crash["completed_steps"]
+
+
+def test_holdout_verdict_with_crash_just_before_final_batch(tmp_path):
+    """Kill the owner at total_steps-1, before any verdict exists.
+
+    The takeover worker resumes from the confirmed checkpoint, evaluates the
+    held-out sample at the final batch and persists weights, progress, both
+    metrics and the verdict together.  No earlier query may claim a verdict.
+    """
+    db = tmp_path / "training.db"
+    with Server(db, free_port()) as server:
+        job = server.post("/jobs", holdout_dataset())
+        total = job["total_steps"]
+        # Deterministic abrupt death right after the penultimate batch commits.
+        worker_a = start_worker(db, "worker-a", TRAINING_DEMO_CRASH_AFTER=str(total - 1))
+        try:
+            wait_for(
+                lambda: server.get(f"/jobs/{job['job_id']}")["completed_steps"] >= total - 1,
+                timeout=90,
+                message="penultimate batch",
+            )
+        finally:
+            stop_worker(worker_a)
+        before = server.get(f"/jobs/{job['job_id']}")
+        assert before["status"] == "running"
+        assert before["completed_steps"] == total - 1
+        assert before["evaluation"] is None
+        assert before["threshold_met"] is None
+        assert before["recall"] is None and before["false_positive_rate"] is None
+
+        worker_b = start_worker(db, "worker-b")
+        try:
+            final = wait_completed(server, job["job_id"])
+        finally:
+            stop_worker(worker_b)
+
+        assert final["completed_steps"] == final["total_steps"] == total
+        assert final["evaluation"]["evaluated"] is True
+        assert final["threshold_met"] in (True, False)
+        assert 0.0 <= final["recall"] <= 1.0
+        assert 0.0 <= final["false_positive_rate"] <= 1.0
+        assert final["evaluation"]["holdout_records"] == 6
+        assert final["evaluation"]["prediction_threshold"] == 0.5
+        assert final["evaluation"]["min_recall"] == 0.5
+        assert final["evaluation"]["max_false_positive_rate"] == 0.5
+        assert final["evaluation"]["threshold_met"] == final["threshold_met"]
+        # The verdict belongs to the final checkpoint and was written by the
+        # takeover worker.
+        checkpoints = server.get(f"/jobs/{job['job_id']}/checkpoints")
+        assert checkpoints[-1]["step"] == total
+        assert checkpoints[-1]["weights"] == final["final_weights"]
+        assert checkpoints[-1]["worker_id"] == "worker-b"
+        events = server.get(f"/jobs/{job['job_id']}/events")
+        completed_events = [e for e in events if e["event"] == "job_completed"]
+        assert len(completed_events) == 1
+        assert completed_events[0]["detail"]["threshold_met"] == final["threshold_met"]
+        assert completed_events[0]["detail"]["recall"] == final["recall"]
+        # The holdout sample did not change the training run.
+        assert final["total_steps"] == total
+        assert final["record_count"] == 40
 
 
 def test_late_worker_cannot_regress_or_false_complete(tmp_path):

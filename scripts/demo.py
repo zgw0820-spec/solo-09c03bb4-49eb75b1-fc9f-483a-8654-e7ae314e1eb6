@@ -77,27 +77,48 @@ def _state_if_completed(job_id: str) -> dict | None:
     return state if state["status"] == "completed" else None
 
 
-def sample_records(count: int = 40, seed: int = 3) -> dict:
-    """Synthetic fan vibration/current records with shutdown labels."""
+def sample_records(count: int = 40, seed: int = 3, holdout: int = 8) -> dict:
+    """Synthetic fan vibration/current records with shutdown labels.
+
+    ``holdout`` independently labelled records (both classes) are attached so
+    the final batch can compute recall / false-positive rate and a
+    pass/fail verdict.  They are not used for training or standardisation.
+    """
     rng = random.Random(seed)
-    features, labels = [], []
-    for index in range(count):
-        vibration = rng.gauss(0.2, 1.0)
-        current = rng.gauss(1.0, 1.0)
+
+    def record(shutdown: bool) -> tuple[list[float], int]:
+        if shutdown:
+            vibration = rng.gauss(0.9, 0.6)
+            current = rng.gauss(1.9, 0.6)
+        else:
+            vibration = rng.gauss(-0.2, 0.7)
+            current = rng.gauss(0.4, 0.7)
         temperature = rng.gauss(0.5, 1.0)
-        label = 1 if vibration + current + 0.3 * temperature > 2.1 else 0
-        if index % 11 == 0:
-            label = 1
-        features.append(
+        return (
             [
                 round(vibration, 4),
                 round(current, 4),
                 round(temperature, 4),
                 round(abs(vibration - current), 4),
-            ]
+            ],
+            int(shutdown),
         )
-        labels.append(label)
-    return {"features": features, "labels": labels, "epochs": 3}
+
+    training = [record(rng.random() < 0.4) for _ in range(count)]
+    features = [row for row, _ in training]
+    labels = [label for _, label in training]
+    # Held-out sample: balanced classes, drawn from the same distributions but
+    # independently of the training records.
+    held = [record(index < holdout // 2) for index in range(holdout)]
+    return {
+        "features": features,
+        "labels": labels,
+        "epochs": 3,
+        "holdout_features": [row for row, _ in held],
+        "holdout_labels": [label for _, label in held],
+        "min_recall": 0.5,
+        "max_false_positive_rate": 0.5,
+    }
 
 
 def show(job: dict) -> None:
@@ -126,10 +147,20 @@ def kill_worker(mode: str, worker_id: str) -> None:
 
 
 def step_1_submit() -> dict:
-    print("\n[1] submitting 40 records, 3 epochs (8 per batch -> 5 batches/epoch, 15 steps)")
+    print(
+        "\n[1] submitting 40 records + 8 held-out records, 3 epochs "
+        "(5 batches/epoch, 15 steps)"
+    )
     job = call("POST", "/jobs", sample_records())
     print(f"    job_id={job['job_id']}")
     show(job)
+    if job["holdout"]:
+        print(
+            f"    holdout: {job['holdout']['record_count']} records,"
+            f" min_recall={job['holdout']['min_recall']},"
+            f" max_false_positive_rate={job['holdout']['max_false_positive_rate']}"
+            f" (no verdict yet: threshold_met={job['threshold_met']})"
+        )
     return job
 
 
@@ -189,6 +220,16 @@ def step_4_failover(job_id: str) -> dict:
         message="completion after failover",
     )
     show(final)
+    if final["evaluation"] and final["evaluation"]["evaluated"]:
+        print(
+            f"    holdout verdict: recall={final['recall']:.3f}"
+            f" (min {final['evaluation']['min_recall']:.3f}),"
+            f" false_positive_rate={final['false_positive_rate']:.3f}"
+            f" (max {final['evaluation']['max_false_positive_rate']:.3f})"
+            f" -> threshold_met={final['threshold_met']}"
+        )
+    else:
+        print("    no holdout samples attached: no pass/fail verdict")
     events = call("GET", f"/jobs/{job_id}/events")
     for event in events:
         if event["event"] in {"training_started", "job_completed"}:
@@ -205,10 +246,17 @@ def step_4_failover(job_id: str) -> dict:
 
 
 def step_5_final(job_id: str) -> dict:
-    print("\n[5] final weights")
+    print("\n[5] final weights and persisted verdict")
     final = call("GET", f"/jobs/{job_id}")
     print(f"    weights = {final['final_weights']}")
     print(f"    loss    = {final['loss']:.12f}")
+    if final["evaluation"] and final["evaluation"]["evaluated"]:
+        print(
+            f"    recall  = {final['recall']!r}"
+            f"  false_positive_rate = {final['false_positive_rate']!r}"
+            f"  threshold_met = {final['threshold_met']}"
+        )
+    print(f"    evaluation = {json.dumps(final['evaluation'], ensure_ascii=False)}")
     print(f"    saved to data/ (SQLite). Re-read from the API at /jobs/{job_id}")
     return final
 
@@ -227,6 +275,20 @@ def step_6_reference(interrupted: dict) -> None:
     print(f"    uninterrupted weights = {reference['final_weights']}")
     print(f"    weights identical      : {same_weights}")
     print(f"    loss identical         : {same_loss} ({reference['loss']!r})")
+    if interrupted["evaluation"] and interrupted["evaluation"]["evaluated"]:
+        same_verdict = (
+            reference["recall"] == interrupted["recall"]
+            and reference["false_positive_rate"] == interrupted["false_positive_rate"]
+            and reference["threshold_met"] == interrupted["threshold_met"]
+        )
+        print(
+            f"    verdict identical      : {same_verdict}"
+            f" (recall={reference['recall']!r},"
+            f" fpr={reference['false_positive_rate']!r},"
+            f" threshold_met={reference['threshold_met']!r})"
+        )
+        if not same_verdict:
+            raise SystemExit("FAIL: resumed run produced a different holdout verdict")
     if not (same_weights and same_loss):
         raise SystemExit("FAIL: resumed run differs from the uninterrupted run")
     print("    PASS: resumed run is bit-identical to an uninterrupted run")

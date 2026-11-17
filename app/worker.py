@@ -70,31 +70,67 @@ class Worker:
         print(f"[{self.worker_id}] started", flush=True)
         try:
             while not self.stop_event.is_set():
-                if not self._run_one_job():
+                try:
+                    claimed = self._run_one_job()
+                except Exception as exc:  # noqa: BLE001 - keep the container alive
+                    print(f"[{self.worker_id}] poll failed: {exc}", flush=True)
+                    claimed = False
+                if not claimed:
                     self.beat("idle")
                     self.stop_event.wait(self.settings.poll_interval)
                     continue
                 try:
                     self._train()
+                except Exception as exc:  # noqa: BLE001
+                    # Training already rolled back its last batch; report and
+                    # keep serving.  The job is resumed from its checkpoint.
+                    print(
+                        f"[{self.worker_id}] training loop error: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    self.stop_event.wait(self.settings.poll_interval)
                 finally:
                     if self.lease is not None:
-                        lease_mod.release(self.settings.db_path, self.lease)
+                        try:
+                            lease_mod.release(self.settings.db_path, self.lease)
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"[{self.worker_id}] lease release failed: {exc}", flush=True)
                         self.lease = None
         finally:
             if self.lease is not None:
-                lease_mod.release(self.settings.db_path, self.lease)
-            lease_mod.heartbeat(self.settings.db_path, self.worker_id, "stopped")
+                try:
+                    lease_mod.release(self.settings.db_path, self.lease)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[{self.worker_id}] lease release failed: {exc}", flush=True)
+            try:
+                lease_mod.heartbeat(self.settings.db_path, self.worker_id, "stopped")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{self.worker_id}] final heartbeat failed: {exc}", flush=True)
             print(f"[{self.worker_id}] stopped", flush=True)
 
     def _run_one_job(self) -> bool:
-        """Claim one job's lease. Returns ``False`` when nothing is claimable."""
-        for job_id in store.claimable_jobs(self.settings.db_path):
-            lease = lease_mod.acquire(
-                self.settings.db_path,
-                job_id,
-                self.worker_id,
-                self.settings.lease_seconds,
-            )
+        """Claim one job's lease. Returns ``False`` when nothing is claimable.
+
+        An unreachable shared database must not kill the worker: it backs off
+        and retries on the next poll.
+        """
+        try:
+            claimable = store.claimable_jobs(self.settings.db_path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{self.worker_id}] cannot list jobs yet: {exc}", flush=True)
+            return False
+        for job_id in claimable:
+            try:
+                lease = lease_mod.acquire(
+                    self.settings.db_path,
+                    job_id,
+                    self.worker_id,
+                    self.settings.lease_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{self.worker_id}] cannot claim {job_id}: {exc}", flush=True)
+                return False
             if lease is not None:
                 self.lease = lease
                 return True
@@ -135,13 +171,47 @@ class Worker:
                 )
             except LeaseLost:
                 print(f"[{self.worker_id}] lost lease on {job_id}; stopping", flush=True)
-                store.record_event(
-                    self.settings.db_path,
-                    job_id,
-                    "lease_lost",
-                    {"worker_id": self.worker_id, "lease_epoch": self.lease.epoch},
-                )
+                try:
+                    store.record_event(
+                        self.settings.db_path,
+                        job_id,
+                        "lease_lost",
+                        {"worker_id": self.worker_id, "lease_epoch": self.lease.epoch},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[{self.worker_id}] cannot record lease loss: {exc}", flush=True)
                 self.lease = None
+                return
+            except Exception as exc:  # noqa: BLE001 - any failure must not lose the checkpoint
+                # The batch transaction rolled back, so the job is still exactly
+                # at the last confirmed checkpoint.  Drop the lease and let a
+                # worker (this one or another) resume from there.
+                print(
+                    f"[{self.worker_id}] batch failed on {job_id}: "
+                    f"{type(exc).__name__}: {exc}; will retry from checkpoint",
+                    flush=True,
+                )
+                try:
+                    store.record_event(
+                        self.settings.db_path,
+                        job_id,
+                        "batch_failed",
+                        {
+                            "worker_id": self.worker_id,
+                            "lease_epoch": self.lease.epoch,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
+                    )
+                except Exception:  # noqa: BLE001 - the database itself may be down
+                    pass
+                try:
+                    # Give the job up immediately so another worker can resume
+                    # from the confirmed checkpoint without waiting for expiry.
+                    lease_mod.release(self.settings.db_path, self.lease)
+                except Exception:  # noqa: BLE001
+                    pass
+                self.lease = None
+                self.stop_event.wait(self.settings.poll_interval)
                 return
             print(
                 f"[{self.worker_id}] {job_id} step {result['step']}/{result['total_steps']} "
@@ -149,7 +219,20 @@ class Worker:
                 flush=True,
             )
             if result["status"] == "completed":
-                print(f"[{self.worker_id}] completed {job_id}", flush=True)
+                if result.get("threshold_met") is None:
+                    print(
+                        f"[{self.worker_id}] completed {job_id} (no holdout samples; "
+                        "no pass/fail verdict)",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[{self.worker_id}] completed {job_id} "
+                        f"recall={result['recall']:.3f} "
+                        f"false_positive_rate={result['false_positive_rate']:.3f} "
+                        f"threshold_met={result['threshold_met']}",
+                        flush=True,
+                    )
                 return
             self._pause_after_batch(job_id)
 

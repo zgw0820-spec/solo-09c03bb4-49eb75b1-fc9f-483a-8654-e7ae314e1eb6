@@ -30,9 +30,15 @@ app = FastAPI(
         "regression with batch size 8, learning rate 0.1 and momentum 0.9.\n\n"
         "All training is executed by workers. Every batch commits weights, "
         "momentum, loss and progress in one atomic checkpoint; after a failure "
-        "the next worker resumes from the newest committed checkpoint."
+        "the next worker resumes from the newest committed checkpoint.\n\n"
+        "A job may carry 2-16 independently labelled held-out records (both "
+        "classes) plus a minimum recall and maximum false-positive rate. They "
+        "are standardised with the training statistics, never trained on, and "
+        "scored once at the final batch; that batch persists the weights, "
+        "recall, false-positive rate and pass/fail verdict atomically with "
+        "completion."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -52,6 +58,41 @@ class TrainingRequest(BaseModel):
         examples=[[0, 0, 1, 1]],
     )
     epochs: int = Field(2, ge=2, le=5, description="Training epochs (2-5).")
+    holdout_features: list[list[float]] | None = Field(
+        None,
+        description=(
+            "Optional 2-16 independently labelled held-out records with the same "
+            "feature columns as the training sample. They are never used for "
+            "training or for fitting column statistics."
+        ),
+        examples=[[[0.13, 3.6], [0.69, 5.3]]],
+    )
+    holdout_labels: list[int] | None = Field(
+        None,
+        description=(
+            "Labels for the held-out records; must contain both 0 (healthy) and "
+            "1 (shutdown warning)."
+        ),
+        examples=[[0, 1]],
+    )
+    min_recall: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Required minimum recall on the held-out records (0-1). Only "
+            "evaluated after the final batch; defaults to 0."
+        ),
+    )
+    max_false_positive_rate: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Allowed maximum false-positive rate on the held-out records (0-1). "
+            "Only evaluated after the final batch; defaults to 1."
+        ),
+    )
 
 
 @app.get("/health", tags=["system"])
@@ -66,7 +107,14 @@ def submit_job(request: TrainingRequest) -> dict[str, Any]:
     """Validate and enqueue a training job; it is picked up by a worker."""
     try:
         return store.create_job(
-            settings.db_path, request.features, request.labels, request.epochs
+            settings.db_path,
+            request.features,
+            request.labels,
+            request.epochs,
+            request.holdout_features,
+            request.holdout_labels,
+            request.min_recall,
+            request.max_false_positive_rate,
         )
     except InputError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

@@ -6,12 +6,20 @@ database.  A batch commit writes, together and atomically:
 * the checkpoint row: step, weights, momentum, batch loss, dataset loss,
   commit time, worker and lease epoch;
 * the job row: current weights/momentum/loss, ``completed_steps`` and status;
+* for the final batch, the held-out recall / false-positive rate, the
+  threshold verdict and the evaluation detail - in the same transaction as
+  the ``completed`` status, so a completed job always has its conclusion;
 * the lease heartbeat, proving the committer is still the live owner;
 * the audit event for a completion.
 
 The append-only checkpoint stream is the source of truth.  A restart always
 reloads the newest checkpoint, and progress is only advanced by one inside the
 write lock, so no reader sees a step whose weights and progress disagree.
+
+Held-out records never take part in training and never contribute to the
+column statistics.  They are standardised with the training sample's
+statistics when the job is created, then scored once - with the weights of the
+final committed batch - inside the final commit transaction.
 """
 from __future__ import annotations
 
@@ -31,10 +39,11 @@ from .features import (
     MIN_EPOCHS,
     MOMENTUM,
     InputError,
-    normalise,
+    normalise_holdout,
+    normalise_with_stats,
 )
 from .lease import Lease, LeaseLost, owner_ok
-from .model import dataset_loss, sgd_step
+from .model import dataset_loss, evaluate_holdout, sgd_step
 
 JOB_STATUSES = ("queued", "running", "completed")
 
@@ -66,22 +75,80 @@ def _event(conn, job_id: str, event: str, detail: dict[str, Any] | None = None) 
     )
 
 
+def _no_holdout_evaluation() -> dict[str, Any]:
+    """Conclusion persisted for a job submitted without held-out samples."""
+    return {
+        "evaluated": False,
+        "threshold_met": None,
+        "reason": "no_holdout_samples",
+        "prediction_threshold": 0.5,
+        "holdout_records": 0,
+        "positive_records": 0,
+        "negative_records": 0,
+        "recall": None,
+        "false_positive_rate": None,
+        "min_recall": None,
+        "max_false_positive_rate": None,
+        "true_positive": None,
+        "false_positive": None,
+        "true_negative": None,
+        "false_negative": None,
+    }
+
+
 def create_job(
     db_path,
     features: list[list[float]],
     labels: list[int],
     epochs: int,
+    holdout_features: list[list[float]] | None = None,
+    holdout_labels: list[int] | None = None,
+    min_recall: float | None = None,
+    max_false_positive_rate: float | None = None,
 ) -> dict[str, Any]:
-    """Validate, normalise and enqueue a training job."""
+    """Validate, normalise and enqueue a training job.
+
+    Column statistics are fitted on ``features`` only.  Optional held-out
+    records are validated, transformed with those statistics and stored for
+    the final-batch evaluation; they never take part in training.
+    """
     if not (MIN_EPOCHS <= epochs <= MAX_EPOCHS):
         raise InputError(f"epochs must be between {MIN_EPOCHS} and {MAX_EPOCHS}")
-    design, targets = normalise(features, labels)
+    design, targets, stats = normalise_with_stats(features, labels)
     feature_dim = int(design.shape[1])
+    raw_feature_count = feature_dim - 1
     per_epoch = math.ceil(design.shape[0] / BATCH_SIZE)
     total_steps = per_epoch * epochs
     weights = np.zeros(feature_dim, dtype=np.float64)
     velocity = np.zeros(feature_dim, dtype=np.float64)
     initial_loss = dataset_loss(weights, design, targets)
+
+    has_holdout = holdout_features is not None or holdout_labels is not None
+    holdout_design: np.ndarray | None = None
+    holdout_targets: np.ndarray | None = None
+    if has_holdout:
+        if holdout_features is None or holdout_labels is None:
+            raise InputError(
+                "holdout_features and holdout_labels must be provided together"
+            )
+        if min_recall is None:
+            min_recall = 0.0
+        if max_false_positive_rate is None:
+            max_false_positive_rate = 1.0
+        if not (0.0 <= float(min_recall) <= 1.0):
+            raise InputError("min_recall must be between 0 and 1")
+        if not (0.0 <= float(max_false_positive_rate) <= 1.0):
+            raise InputError("max_false_positive_rate must be between 0 and 1")
+        holdout_design, holdout_targets = normalise_holdout(
+            holdout_features, holdout_labels, stats, raw_feature_count
+        )
+    else:
+        if min_recall is not None or max_false_positive_rate is not None:
+            raise InputError(
+                "min_recall and max_false_positive_rate require holdout samples"
+            )
+        min_recall = None
+        max_false_positive_rate = None
 
     job_id = uuid.uuid4().hex
     now = time.time()
@@ -91,8 +158,10 @@ def create_job(
             INSERT INTO jobs(
                 job_id, status, feature_dim, epochs, batch_size, record_count,
                 total_batches, learning_rate, momentum, features_json, labels_json,
-                weights_json, velocity_json, loss, completed_steps, created_at, updated_at
-            ) VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                weights_json, velocity_json, loss, completed_steps, holdout_count,
+                min_recall, max_false_positive_rate, standardisation_json,
+                holdout_features_json, holdout_labels_json, created_at, updated_at
+            ) VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -108,6 +177,24 @@ def create_job(
                 _dumps(weights),
                 _dumps(velocity),
                 initial_loss,
+                int(holdout_targets.shape[0]) if holdout_targets is not None else 0,
+                None if min_recall is None else float(min_recall),
+                (
+                    None
+                    if max_false_positive_rate is None
+                    else float(max_false_positive_rate)
+                ),
+                json.dumps(stats.as_json()),
+                (
+                    None
+                    if holdout_design is None
+                    else json.dumps(holdout_design.tolist())
+                ),
+                (
+                    None
+                    if holdout_targets is None
+                    else json.dumps([float(v) for v in holdout_targets], allow_nan=False)
+                ),
                 now,
                 now,
             ),
@@ -121,6 +208,11 @@ def create_job(
                 "epochs": epochs,
                 "batches_per_epoch": per_epoch,
                 "total_steps": total_steps,
+                "holdout_records": (
+                    0 if holdout_targets is None else int(holdout_targets.shape[0])
+                ),
+                "min_recall": min_recall,
+                "max_false_positive_rate": max_false_positive_rate,
             },
         )
     job = get_job(db_path, job_id)
@@ -132,7 +224,8 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
     """Read a consistent snapshot of the latest confirmed state.
 
     The job row and its newest checkpoint are read in one transaction.  Their
-    step and weights must agree; a mismatch would mean a torn commit.
+    step and weights must agree; a mismatch would mean a torn commit.  A
+    completed job must also carry its stored evaluation conclusion.
     """
     with reader(db_path) as conn:
         row = _job_row(conn, job_id)
@@ -150,13 +243,21 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
                 raise StateConflict("latest checkpoint weights do not match job weights")
             if checkpoint["velocity_json"] != row["velocity_json"]:
                 raise StateConflict("latest checkpoint momentum does not match job momentum")
+        if row["status"] == "completed" and row["evaluation_json"] is None:
+            raise StateConflict("job is completed but has no stored evaluation conclusion")
         design = np.asarray(json.loads(row["features_json"]), dtype=np.float64)
         targets = np.asarray(json.loads(row["labels_json"]), dtype=np.float64)
         evaluation_loss = dataset_loss(_loads(row["weights_json"]), design, targets)
+        evaluation = (
+            json.loads(row["evaluation_json"])
+            if row["evaluation_json"] is not None
+            else None
+        )
 
     completed = int(row["completed_steps"])
     total = int(row["total_batches"]) * int(row["epochs"])
     latest_step = int(checkpoint["step"]) if checkpoint is not None else 0
+    holdout_count = int(row["holdout_count"] or 0)
     return {
         "job_id": row["job_id"],
         "status": row["status"],
@@ -178,6 +279,27 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
         "final_weights": (
             _loads(row["weights_json"]).tolist() if row["status"] == "completed" else None
         ),
+        "holdout": (
+            {
+                "record_count": holdout_count,
+                "min_recall": (
+                    None if row["min_recall"] is None else float(row["min_recall"])
+                ),
+                "max_false_positive_rate": (
+                    None
+                    if row["max_false_positive_rate"] is None
+                    else float(row["max_false_positive_rate"])
+                ),
+            }
+            if holdout_count
+            else None
+        ),
+        "recall": None if evaluation is None else evaluation.get("recall"),
+        "false_positive_rate": (
+            None if evaluation is None else evaluation.get("false_positive_rate")
+        ),
+        "threshold_met": None if evaluation is None else evaluation.get("threshold_met"),
+        "evaluation": evaluation,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "finished_at": row["finished_at"],
@@ -264,6 +386,30 @@ def claimable_jobs(db_path, limit: int = 20) -> list[str]:
     return [row["job_id"] for row in rows]
 
 
+def _final_evaluation(row, weights: np.ndarray) -> dict[str, Any]:
+    """Score the held-out sample with the final weights.
+
+    Runs inside the final commit transaction.  If it raises, the transaction
+    rolls back, so the job stays at ``total_steps - 1`` with the previous
+    checkpoint confirmed and is picked up again by the next worker.
+    """
+    if not int(row["holdout_count"] or 0):
+        return _no_holdout_evaluation()
+    holdout_design = np.asarray(
+        json.loads(row["holdout_features_json"]), dtype=np.float64
+    )
+    holdout_targets = np.asarray(
+        json.loads(row["holdout_labels_json"]), dtype=np.float64
+    )
+    return evaluate_holdout(
+        weights,
+        holdout_design,
+        holdout_targets,
+        float(row["min_recall"]),
+        float(row["max_false_positive_rate"]),
+    )
+
+
 def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, Any]:
     """Commit exactly one batch for ``lease``'s job.
 
@@ -271,6 +417,12 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
     conditional on the fence token, so a worker that lost its lease - or that
     wakes up late after being suspended - raises :class:`LeaseLost` instead of
     writing, and can never move progress backwards.
+
+    On the final step the holdout recall / false-positive rate, the threshold
+    verdict and the full evaluation detail are written in the very same
+    transaction that sets ``status='completed'``.  There is therefore no
+    observable state in which a job is completed without a conclusion, and no
+    earlier step carries a pass/fail verdict.
     """
     if batch_delay > 0:
         time.sleep(batch_delay)
@@ -284,11 +436,24 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
         if row is None:
             raise JobNotFound(lease.job_id)
         if row["status"] == "completed":
+            # Another worker completed the job between our claim and this
+            # commit.  Report the stored conclusion; never re-evaluate.
+            stored = (
+                json.loads(row["evaluation_json"])
+                if row["evaluation_json"] is not None
+                else None
+            )
             return {
                 "status": "completed",
                 "job_id": lease.job_id,
                 "step": int(row["completed_steps"]),
                 "total_steps": int(row["total_batches"]) * int(row["epochs"]),
+                "loss": float(row["loss"]),
+                "threshold_met": None if stored is None else stored.get("threshold_met"),
+                "recall": None if stored is None else stored.get("recall"),
+                "false_positive_rate": (
+                    None if stored is None else stored.get("false_positive_rate")
+                ),
                 "worker_id": lease.worker_id,
                 "lease_epoch": lease.epoch,
             }
@@ -320,11 +485,16 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
         evaluation = dataset_loss(new_weights, design, targets)
         now = time.time()
 
+        conclusion: dict[str, Any] | None = None
+        if final:
+            conclusion = _final_evaluation(row, new_weights)
+
         updated = conn.execute(
             """
             UPDATE jobs
                SET weights_json=?, velocity_json=?, loss=?, completed_steps=?,
-                   status=?, updated_at=?, finished_at=?
+                   status=?, updated_at=?, finished_at=?,
+                   recall=?, false_positive_rate=?, holdout_passed=?, evaluation_json=?
              WHERE job_id=? AND completed_steps=? AND status IN ('queued','running')
             """,
             (
@@ -335,6 +505,18 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
                 "completed" if final else "running",
                 now,
                 now if final else None,
+                None if conclusion is None else conclusion["recall"],
+                None if conclusion is None else conclusion["false_positive_rate"],
+                (
+                    None
+                    if conclusion is None or conclusion["threshold_met"] is None
+                    else int(bool(conclusion["threshold_met"]))
+                ),
+                (
+                    None
+                    if conclusion is None
+                    else json.dumps(conclusion, allow_nan=False)
+                ),
                 lease.job_id,
                 completed,
             ),
@@ -364,11 +546,19 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
             "UPDATE leases SET heartbeat_at=? WHERE job_id=?", (now, lease.job_id)
         )
         if final:
+            assert conclusion is not None
             _event(
                 conn,
                 lease.job_id,
                 "job_completed",
-                {"completed_steps": new_completed, "worker_id": lease.worker_id},
+                {
+                    "completed_steps": new_completed,
+                    "worker_id": lease.worker_id,
+                    "holdout_evaluated": bool(conclusion["evaluated"]),
+                    "recall": conclusion["recall"],
+                    "false_positive_rate": conclusion["false_positive_rate"],
+                    "threshold_met": conclusion["threshold_met"],
+                },
             )
     return {
         "status": "completed" if final else "running",
@@ -379,6 +569,11 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
         "loss": evaluation,
         "worker_id": lease.worker_id,
         "lease_epoch": lease.epoch,
+        "threshold_met": None if conclusion is None else conclusion["threshold_met"],
+        "recall": None if conclusion is None else conclusion["recall"],
+        "false_positive_rate": (
+            None if conclusion is None else conclusion["false_positive_rate"]
+        ),
     }
 
 

@@ -159,6 +159,36 @@ def dataset(seed: int = 21, records: int = 40) -> dict:
     return {"features": features, "labels": labels, "epochs": 3}
 
 
+def holdout_dataset(seed: int = 31, records: int = 40, held: int = 8) -> dict:
+    """Training data plus an independent held-out sample with both classes."""
+    import random
+
+    rng = random.Random(seed)
+    features, labels = [], []
+    for _ in range(records):
+        label = int(rng.random() < 0.4)
+        centre = 1.0 if label else -1.0
+        features.append([round(rng.gauss(centre, 0.8), 4) for _ in range(4)])
+        labels.append(label)
+    holdout = []
+    for index in range(held):
+        centre = 1.0 if index < held // 2 else -1.0
+        holdout.append(
+            ([round(rng.gauss(centre, 0.8), 4) for _ in range(4)],
+             1 if index < held // 2 else 0)
+        )
+    body = {"features": features, "labels": labels, "epochs": 3}
+    body.update(
+        {
+            "holdout_features": [row for row, _ in holdout],
+            "holdout_labels": [label for _, label in holdout],
+            "min_recall": 0.5,
+            "max_false_positive_rate": 0.5,
+        }
+    )
+    return body
+
+
 def completed_state(port: int, job_id: str) -> dict:
     return wait_for(
         lambda: (state := get(port, f"/jobs/{job_id}"))["status"] == "completed" and state,
@@ -167,12 +197,12 @@ def completed_state(port: int, job_id: str) -> dict:
     )
 
 
-def run_reference(tmp: Path) -> dict:
-    db = tmp / "reference.db"
+def run_reference(tmp: Path, holdout: bool = False) -> dict:
+    db = tmp / ("reference-holdout.db" if holdout else "reference.db")
     api, port = start_api(db)
     worker = start_worker(db, "solo")
     try:
-        job = post(port, "/jobs", dataset())
+        job = post(port, "/jobs", holdout_dataset() if holdout else dataset())
         return completed_state(port, job["job_id"])
     finally:
         stop(worker)
@@ -218,6 +248,63 @@ def check_equivalence(tmp: Path) -> bool:
     print(
         f"  PASS: killed at step {at_crash['completed_steps']},"
         f" resumed to {final['completed_steps']}, weights match the uninterrupted run"
+    )
+    return True
+
+
+def check_holdout_verdict(tmp: Path) -> bool:
+    """Kill the owner right before the final batch; the verdict must appear
+    exactly once, atomically with completion, and match an uninterrupted run.
+    """
+    reference = run_reference(tmp, holdout=True)
+    assert reference["evaluation"]["evaluated"] is True
+    assert reference["threshold_met"] is not None
+
+    db = tmp / "verdict.db"
+    api, port = start_api(db)
+    job = post(port, "/jobs", holdout_dataset())
+    total = job["total_steps"]
+    worker_a = start_worker(db, "worker-a")
+    try:
+        wait_for(
+            lambda: get(port, f"/jobs/{job['job_id']}")["completed_steps"] >= total - 1,
+            60,
+            "penultimate batch",
+        )
+    finally:
+        stop(worker_a, hard=True)
+    before = get(port, f"/jobs/{job['job_id']}")
+    assert before["status"] == "running"
+    assert before["completed_steps"] == total - 1
+    assert before["evaluation"] is None
+    assert before["threshold_met"] is None
+    assert before["recall"] is None and before["false_positive_rate"] is None
+
+    worker_b = start_worker(db, "worker-b")
+    try:
+        final = completed_state(port, job["job_id"])
+        events = get(port, f"/jobs/{job['job_id']}/events")
+    finally:
+        stop(worker_b)
+        stop(api)
+    assert final["evaluation"]["evaluated"] is True
+    assert final["evaluation"]["holdout_records"] == 8
+    assert final["evaluation"]["prediction_threshold"] == 0.5
+    assert final["threshold_met"] in (True, False)
+    assert final["evaluation"]["threshold_met"] == final["threshold_met"]
+    assert final["recall"] == final["evaluation"]["recall"]
+    assert final["false_positive_rate"] == final["evaluation"]["false_positive_rate"]
+    completed_events = [e for e in events if e["event"] == "job_completed"]
+    assert len(completed_events) == 1
+    assert completed_events[0]["detail"]["threshold_met"] == final["threshold_met"]
+    assert final["final_weights"] == reference["final_weights"]
+    assert final["recall"] == reference["recall"]
+    assert final["false_positive_rate"] == reference["false_positive_rate"]
+    assert final["threshold_met"] == reference["threshold_met"]
+    print(
+        f"  PASS: resumed before final batch, verdict recall={final['recall']:.3f}"
+        f" fpr={final['false_positive_rate']:.3f} threshold_met={final['threshold_met']}"
+        " written once with completion and equal to the uninterrupted run"
     )
     return True
 
@@ -278,6 +365,7 @@ def main() -> int:
         for name, check in (
             ("compose", check_compose),
             ("killed-worker equivalence", lambda: check_equivalence(tmp)),
+            ("holdout verdict under failover", lambda: check_holdout_verdict(tmp)),
             ("late-worker fencing", lambda: check_late_worker(tmp)),
         ):
             print(f"[{name}]")

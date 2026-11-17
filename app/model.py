@@ -54,3 +54,66 @@ def sgd_step(
 
 def dataset_loss(weights: np.ndarray, features: np.ndarray, labels: np.ndarray) -> float:
     return batch_loss(weights, features, labels)
+
+
+PREDICTION_THRESHOLD = 0.5
+
+
+def _rate(numerator: int, denominator: int) -> float | None:
+    """A ratio, or ``None`` when its denominator is empty."""
+    return None if denominator == 0 else numerator / denominator
+
+
+def evaluate_holdout(
+    weights: np.ndarray,
+    features: np.ndarray,
+    labels: np.ndarray,
+    min_recall: float,
+    max_false_positive_rate: float,
+) -> dict:
+    """Score held-out records once, with the final weights.
+
+    A record is flagged (early warning) when its shutdown probability is at or
+    above ``PREDICTION_THRESHOLD`` (0.5).
+
+    * recall    = TP / (TP + FN) - share of shutdown records that were flagged
+    * FPR       = FP / (FP + TN) - share of healthy records that were flagged
+    * threshold_met = recall >= min_recall and FPR <= max_false_positive_rate
+
+    The caller guarantees the holdout sample contains both classes, so both
+    rates are defined.
+    """
+    probabilities = sigmoid(features @ weights)
+    predicted = probabilities >= PREDICTION_THRESHOLD
+    actual = labels >= 0.5
+    true_positive = int(np.sum(predicted & actual))
+    false_negative = int(np.sum(~predicted & actual))
+    false_positive = int(np.sum(predicted & ~actual))
+    true_negative = int(np.sum(~predicted & ~actual))
+    positives = true_positive + false_negative
+    negatives = false_positive + true_negative
+    recall = _rate(true_positive, positives)
+    false_positive_rate = _rate(false_positive, negatives)
+    return {
+        "evaluated": True,
+        "threshold_met": bool(
+            recall is not None
+            and false_positive_rate is not None
+            and recall >= min_recall
+            and false_positive_rate <= max_false_positive_rate
+        ),
+        "reason": "holdout_evaluated",
+        "prediction_threshold": PREDICTION_THRESHOLD,
+        "holdout_records": int(labels.shape[0]),
+        "positive_records": positives,
+        "negative_records": negatives,
+        "true_positive": true_positive,
+        "false_positive": false_positive,
+        "true_negative": true_negative,
+        "false_negative": false_negative,
+        "recall": recall,
+        "false_positive_rate": false_positive_rate,
+        "min_recall": float(min_recall),
+        "max_false_positive_rate": float(max_false_positive_rate),
+    }
+

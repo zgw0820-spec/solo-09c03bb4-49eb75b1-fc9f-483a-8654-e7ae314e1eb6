@@ -110,6 +110,66 @@ def test_validation_errors(client):
     assert client.get("/jobs/does-not-exist/checkpoints").status_code == 404
 
 
+def test_holdout_submission_and_validation(client):
+    body = payload(12, 2)
+    body.update(
+        {
+            "holdout_features": [[1.0, 2.0], [1.1, 2.1], [-1.0, -2.0], [-1.2, -2.2]],
+            "holdout_labels": [1, 1, 0, 0],
+            "min_recall": 0.5,
+            "max_false_positive_rate": 0.25,
+        }
+    )
+    response = client.post("/jobs", json=body)
+    assert response.status_code == 201
+    job = response.json()
+    assert job["holdout"] == {
+        "record_count": 4,
+        "min_recall": 0.5,
+        "max_false_positive_rate": 0.25,
+    }
+    assert job["evaluation"] is None
+    assert job["recall"] is None and job["false_positive_rate"] is None
+
+    schema = client.get("/openapi.json").json()
+    props = schema["components"]["schemas"]["TrainingRequest"]["properties"]
+    assert {"holdout_features", "holdout_labels", "min_recall", "max_false_positive_rate"} <= set(
+        props
+    )
+
+    too_many = payload(8)
+    too_many.update(
+        {
+            "holdout_features": [[0.1, 0.2]] * 17,
+            "holdout_labels": [0, 1] * 8 + [0],
+        }
+    )
+    assert client.post("/jobs", json=too_many).status_code == 422
+    single_class = payload(8)
+    single_class.update(
+        {"holdout_features": [[0.1, 0.2], [0.3, 0.4]], "holdout_labels": [1, 1]}
+    )
+    assert client.post("/jobs", json=single_class).status_code == 422
+    labels_without_features = payload(8)
+    labels_without_features["holdout_labels"] = [0, 1]
+    assert client.post("/jobs", json=labels_without_features).status_code == 422
+    out_of_range = payload(8)
+    out_of_range.update(
+        {
+            "holdout_features": [[0.1, 0.2], [0.3, 0.4]],
+            "holdout_labels": [0, 1],
+            "min_recall": 1.5,
+        }
+    )
+    assert client.post("/jobs", json=out_of_range).status_code == 422
+    wrong_width = payload(8)
+    wrong_width.update({"holdout_features": [[0.1], [0.3]], "holdout_labels": [0, 1]})
+    assert client.post("/jobs", json=wrong_width).status_code == 422
+    legacy_ok = client.post("/jobs", json=payload(8))
+    assert legacy_ok.status_code == 201
+    assert legacy_ok.json()["holdout"] is None
+
+
 def test_workers_endpoint_empty(client):
     data = client.get("/workers").json()
     assert "lease_seconds" in data
